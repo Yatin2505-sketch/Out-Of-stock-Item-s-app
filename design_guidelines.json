@@ -1,0 +1,118 @@
+{
+  "theme": "light",
+  "archetype": "ORGANIC & EARTHY",
+  "typography": {
+    "headings": "Cormorant Garamond, serif",
+    "body": "Manrope, sans-serif",
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tight leading-none",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight leading-tight",
+      "h3": "text-xl sm:text-2xl tracking-tight",
+      "h4": "text-lg sm:text-xl",
+      "body": "text-base leading-relaxed",
+      "small": "text-sm tracking-wide"
+    }
+  },
+  "colors": {
+    "background": "#F9F8F6",
+    "surface": "#FFFFFF",
+    "surface_alt": "#F2EFEB",
+    "primary": "#4A5D4E",
+    "primary_hover": "#3D4D40",
+    "accent": "#C97A63",
+    "text_main": "#2C312E",
+    "text_muted": "#6B726C",
+    "border": "#E5E1DB",
+    "kanban_column_bg": "#F2EFEB"
+  },
+  "visual_enhancers": {
+    "shadows": "shadow-[0_4px_20px_rgba(74,93,78,0.05)] for cards, hover: shadow-[0_8px_30px_rgba(74,93,78,0.08)]",
+    "borders": "1px solid border-border with rounded-xl",
+    "radius": "rounded-xl for cards, rounded-full for buttons/pills"
+  },
+  "components": {
+    "Button": "Pill-shaped, transition-transform duration-200 hover:-translate-y-0.5",
+    "Card": "Flat background, subtle border, no heavy drop shadows default, lift on hover",
+    "Kanban": "Custom drag-and-drop columns using @hello-pangea/dnd. Columns have a muted background, cards are crisp white.",
+    "Input": "Shadcn input with rounded-lg, focus:ring-primary focus:border-primary",
+    "Table": "Clean lines, stripped rows with surface_alt, bold table headers"
+  },
+  "layouts": {
+    "dashboard": "F-Pattern scanning layout. Left sidebar on desktop, bottom tab bar or collapsible drawer on mobile.",
+    "kanban": "Horizontal scrollable flex container for columns on mobile, CSS grid on desktop.",
+    "employee_entry": "Minimalist centered layout, large autocomplete input, focused entirely on speed."
+  },
+  "grids": {
+    "bento_desktop": "grid-cols-1 md:grid-cols-4 gap-6",
+    "kanban_desktop": "flex gap-6 overflow-x-auto pb-4"
+  },
+  "motion": {
+    "hover": "transition-transform duration-200, transition-colors duration-200",
+    "entrance": "framer-motion fade-in and slide-up (y: 20) staggered",
+    "kanban_drag": "Scale up slightly (scale: 1.02) and add shadow while dragging"
+  },
+  "responsive": {
+    "breakpoint": "mobile-first",
+    "layout": "Stack single column for forms/tables. Kanban converts to vertical stack or horizontal swipeable carousel on mobile. Hide sidebar, use hamburger menu.",
+    "typography": "Scale down h1 to text-4xl on mobile. Ensure input text is 16px to prevent iOS zoom.",
+    "overflow_guard": "w-full max-w-full overflow-x-hidden for main container",
+    "tap_targets": "min-h-[44px] min-w-[44px] for all interactive elements"
+  },
+  "accessibility": {
+    "contrast": "Ensure primary text over background meets 4.5:1. Button text must contrast with primary color.",
+    "focus": "focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 focus:ring-offset-background",
+    "data_testid": "MANDATORY on all buttons, links, inputs, and drag items (e.g., 'medicine-input', 'submit-btn', 'kanban-item-123')"
+  },
+  "media": {
+    "images": [
+      {
+        "url": "https://images.unsplash.com/photo-1777620843115-a317c59007d6?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDV8MHwxfHNlYXJjaHwyfHxhcG90aGVjYXJ5JTIwYm90dGxlcyUyMHZpbnRhZ2V8ZW58MHx8fHwxNzg3Mjk1MDY2fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Rows of glass apothecary jars filled with colorful liquids",
+        "category": "login_background"
+      },
+      {
+        "url": "https://images.pexels.com/photos/8666445/pexels-photo-8666445.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "A collection of vintage glass bottles displayed on a wooden table in an indoor setting.",
+        "category": "employee_dashboard_hero"
+      },
+      {
+        "url": "https://images.pexels.com/photos/9628816/pexels-photo-9628816.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Four brown glass bottles with white caps on a shelf, ideal for storage or medical concepts.",
+        "category": "medicine_database_empty_state"
+      }
+    ],
+    "icons": "lucide-react for standard icons."
+  },
+  "libraries_to_install": [
+    "@hello-pangea/dnd",
+    "framer-motion",
+    "lucide-react",
+    "clsx",
+    "tailwind-merge",
+    "sonner"
+  ],
+  "instructions_to_main_agent": [
+    "Use .js/.jsx file extensions for React components. Do not use .tsx or TypeScript.",
+    "Use Cormorant Garamond for headings and Manrope for body text. Install via Google Fonts in index.css.",
+    "Implement the Kanban board for the Admin view using @hello-pangea/dnd. Ensure draggable items have a subtle shadow and scale up on drag.",
+    "Employee view must be extremely minimal: A large centered input with autocomplete, quantity, and a submit button.",
+    "Ensure the entire app uses an 'Apothecary / Warm Earthy' aesthetic. No pure whites (#FFFFFF is okay for cards, but background should be off-white #F9F8F6).",
+    "Use pill-shaped buttons with hover lift animations.",
+    "Design mobile-first. For mobile, the Kanban board should allow horizontal scrolling of columns.",
+    "Do NOT use pure black or generic greys. Tint greys with sage or warm sand.",
+    "Add 'data-testid' to all interactive elements for testing.",
+    "Use Shadcn components for inputs, dialogs, dropdowns, but heavily customize them to remove the 'Vercel-look'. Add rounded-xl or rounded-full, and use the custom earthy color palette.",
+    "Use 'sonner' for toast notifications."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Do not use generic centered layouts or simplistic gradients.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Never apply universal transition (e.g., transition: all). Add transitions for specific properties.",
+    "Do not center align the app container in App.css.",
+    "Always use modern button styles like pill-shaped, or sharp button with interaction animations.",
+    "NEVER use AI assistant Emoji characters like 🤖🧠💭💡🔮🎯 for icons.",
+    "Every interaction needs micro-animations - hover states, transitions.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Prioritize using pre-existing components from src/components/ui when applicable."
+  ]
+}
