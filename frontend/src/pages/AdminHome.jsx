@@ -11,7 +11,7 @@ const UNASSIGNED = "unassigned";
 export default function AdminHome() {
   const [suppliers, setSuppliers] = useState([]);
   const [logs, setLogs] = useState([]);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; });
   const [loading, setLoading] = useState(true);
 
   // Admin quick add

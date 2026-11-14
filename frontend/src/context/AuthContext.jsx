@@ -26,10 +26,10 @@ export function AuthProvider({ children }) {
     refresh();
   }, [refresh]);
 
-  const login = useCallback(async (email, password) => {
-    const { data } = await api.post("/auth/login", { email, password });
+  const login = useCallback(async (username, password) => {
+    const { data } = await api.post("/auth/login", { username, password });
     if (data.token) localStorage.setItem("access_token", data.token);
-    setUser({ id: data.id, email: data.email, name: data.name, role: data.role });
+    setUser({ id: data.id, username: data.username, name: data.name, role: data.role });
     return data;
   }, []);
 

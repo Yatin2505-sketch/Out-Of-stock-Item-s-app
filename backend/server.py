@@ -1,49 +1,137 @@
-from dotenv import load_dotenv
+"""Stockbook backend.
+
+Self-hosted: all data lives in one SQLite file on this computer
+(data/stockbook.db by default). No external database or cloud service is used.
+The built React app is served from ./static, so one program runs everything.
+"""
 from pathlib import Path
+from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
 import os
 import io
-import re
 import csv
 import uuid
+import secrets
+import sqlite3
 import logging
-import bcrypt
-import jwt
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Query
-from fastapi.responses import StreamingResponse
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr
+import bcrypt
+import jwt
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from xml.sax.saxutils import escape as xml_escape
 
 JWT_ALGORITHM = "HS256"
 UNASSIGNED = "unassigned"
 
-# ---------- Mongo ----------
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("stockbook")
 
-app = FastAPI()
-api_router = APIRouter(prefix="/api")
+# ---------- Storage ----------
+DATA_DIR = Path(os.environ.get("STOCKBOOK_DATA_DIR") or (ROOT_DIR / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "stockbook.db"
+FRONTEND_DIR = Path(os.environ.get("STOCKBOOK_FRONTEND_DIR") or (ROOT_DIR / "static"))
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'employee')),
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS suppliers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS medicines (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    company TEXT NOT NULL DEFAULT '',
+    default_supplier_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_medicines_name ON medicines(name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS logs (
+    id TEXT PRIMARY KEY,
+    medicine_id TEXT,
+    medicine_name TEXT NOT NULL,
+    company TEXT NOT NULL DEFAULT '',
+    quantity TEXT NOT NULL DEFAULT '',
+    supplier_id TEXT,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    added_by_id TEXT NOT NULL,
+    added_by_name TEXT NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_logs_date ON logs(date);
+CREATE INDEX IF NOT EXISTS idx_logs_supplier ON logs(supplier_id);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=15, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def open_db():
+    conn = connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_db():
+    with open_db() as conn:
+        yield conn
+
+
+def init_db():
+    with open_db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA)
+
+
+def row(r: Optional[sqlite3.Row]) -> Optional[dict]:
+    return dict(r) if r is not None else None
+
+
+def rows(rs) -> List[dict]:
+    return [dict(r) for r in rs]
+
+
+def like_pattern(q: str) -> str:
+    q = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{q}%"
+
 
 # ---------- Helpers ----------
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
 
 def verify_password(plain: str, hashed: str) -> bool:
     try:
@@ -51,8 +139,22 @@ def verify_password(plain: str, hashed: str) -> bool:
     except Exception:
         return False
 
-def get_jwt_secret() -> str:
-    return os.environ["JWT_SECRET"]
+
+def _load_jwt_secret() -> str:
+    env = os.environ.get("JWT_SECRET")
+    if env:
+        return env
+    f = DATA_DIR / "jwt_secret.txt"
+    if f.exists():
+        return f.read_text().strip()
+    s = secrets.token_hex(32)
+    f.write_text(s)
+    return s
+
+
+JWT_SECRET = _load_jwt_secret()
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+
 
 def create_access_token(user_id: str, role: str) -> str:
     payload = {
@@ -61,71 +163,84 @@ def create_access_token(user_id: str, role: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(hours=12),
         "type": "access",
     }
-    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
 
 def today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Local time of the shop computer, so a "day" matches the shop's day.
+    return datetime.now().strftime("%Y-%m-%d")
+
 
 def new_id() -> str:
     return str(uuid.uuid4())
 
-async def get_current_user(request: Request) -> dict:
-    token = request.cookies.get("access_token")
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
+
+def get_current_user(request: Request, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = await db.users.find_one({"id": payload["sub"]})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        user.pop("_id", None)
-        user.pop("password_hash", None)
-        return user
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = row(conn.execute(
+        "SELECT id, username, name, role, created_at FROM users WHERE id = ?", (payload["sub"],)
+    ).fetchone())
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
 
-async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+
+def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
+
 # ---------- Models ----------
 class LoginIn(BaseModel):
-    email: EmailStr
+    username: str
     password: str
 
+
 class UserCreate(BaseModel):
-    email: EmailStr
+    username: str
     name: str
     password: str
     role: str = "employee"
 
+
+class PasswordReset(BaseModel):
+    password: str
+
+
 class UserOut(BaseModel):
     id: str
-    email: str
+    username: str
     name: str
     role: str
     created_at: str
 
+
 class SupplierIn(BaseModel):
     name: str
+
 
 class SupplierOut(BaseModel):
     id: str
     name: str
 
+
 class MedicineIn(BaseModel):
     name: str
     company: Optional[str] = ""
     default_supplier_id: Optional[str] = None
+
 
 class MedicineOut(BaseModel):
     id: str
@@ -134,10 +249,12 @@ class MedicineOut(BaseModel):
     default_supplier_id: Optional[str] = None
     default_supplier_name: Optional[str] = None
 
+
 class LogCreate(BaseModel):
     medicine_id: Optional[str] = None  # if selected from suggestions
     medicine_name: str  # fallback if new / unknown
     quantity: str
+
 
 class LogAssignSupplier(BaseModel):
     supplier_id: Optional[str] = None  # None = unassigned
@@ -146,261 +263,282 @@ class LogAssignSupplier(BaseModel):
     # (creating the medicine if it was a brand-new, unknown item).
     remember: bool = False
 
+
 class LogUpdate(BaseModel):
     medicine_name: Optional[str] = None
     quantity: Optional[str] = None
+
 
 class PasteImport(BaseModel):
     text: str
     delimiter: str = ","
 
-# ---------- Auth Endpoints ----------
+
+app = FastAPI(title="Stockbook")
+api_router = APIRouter(prefix="/api")
+
+
+@api_router.get("/health")
+def health():
+    return {"ok": True}
+
+
+# ---------- Auth ----------
 @api_router.post("/auth/login")
-async def login(payload: LoginIn, response: Response):
-    email = payload.email.lower().strip()
-    user = await db.users.find_one({"email": email})
+def login(payload: LoginIn, response: Response, conn: sqlite3.Connection = Depends(get_db)):
+    username = payload.username.strip()
+    user = row(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
     if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     token = create_access_token(user["id"], user["role"])
     response.set_cookie(
-        key="access_token", value=token, httponly=True, secure=True,
-        samesite="none", max_age=43200, path="/"
+        key="access_token", value=token, httponly=True, secure=COOKIE_SECURE,
+        samesite="lax", max_age=43200, path="/",
     )
     return {
         "id": user["id"],
-        "email": user["email"],
+        "username": user["username"],
         "name": user["name"],
         "role": user["role"],
         "token": token,
     }
 
+
 @api_router.post("/auth/logout")
-async def logout(response: Response, _: dict = Depends(get_current_user)):
+def logout(response: Response):
     response.delete_cookie("access_token", path="/")
     return {"ok": True}
 
+
 @api_router.get("/auth/me")
-async def me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"]
-    }
+def me(user: dict = Depends(get_current_user)):
+    return {"id": user["id"], "username": user["username"], "name": user["name"], "role": user["role"]}
+
 
 # ---------- Users (Admin) ----------
 @api_router.get("/users", response_model=List[UserOut])
-async def list_users(_: dict = Depends(require_admin)):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(1000)
-    return users
+def list_users(_: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    return rows(conn.execute(
+        "SELECT id, username, name, role, created_at FROM users ORDER BY name COLLATE NOCASE"
+    ))
+
 
 @api_router.post("/users", response_model=UserOut)
-async def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
-    email = payload.email.lower().strip()
-    if await db.users.find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="Email already exists")
+def create_user(payload: UserCreate, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    username = payload.username.strip()
+    if not username or not payload.name.strip() or not payload.password:
+        raise HTTPException(status_code=400, detail="Name, username and password are required")
     if payload.role not in ("admin", "employee"):
         raise HTTPException(status_code=400, detail="Invalid role")
-    user_doc = {
+    if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+        raise HTTPException(status_code=400, detail="Username already exists")
+    doc = {
         "id": new_id(),
-        "email": email,
+        "username": username,
         "name": payload.name.strip(),
         "role": payload.role,
-        "password_hash": hash_password(payload.password),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    await db.users.insert_one(user_doc)
-    user_doc.pop("password_hash")
-    user_doc.pop("_id", None)
-    return user_doc
+    conn.execute(
+        "INSERT INTO users (id, username, name, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (doc["id"], doc["username"], doc["name"], doc["role"], hash_password(payload.password), doc["created_at"]),
+    )
+    return doc
 
-@api_router.delete("/users/{user_id}")
-async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
-    if user_id == admin["id"]:
-        raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    res = await db.users.delete_one({"id": user_id})
-    if res.deleted_count == 0:
+
+@api_router.put("/users/{user_id}/password")
+def reset_password(user_id: str, payload: PasswordReset, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    if len(payload.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    cur = conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(payload.password), user_id))
+    if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="User not found")
     return {"ok": True}
 
+
+@api_router.delete("/users/{user_id}")
+def delete_user(user_id: str, admin: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True}
+
+
 # ---------- Suppliers ----------
 @api_router.get("/suppliers", response_model=List[SupplierOut])
-async def list_suppliers(_: dict = Depends(get_current_user)):
-    docs = await db.suppliers.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
-    return docs
+def list_suppliers(_: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    return rows(conn.execute("SELECT id, name FROM suppliers ORDER BY name COLLATE NOCASE"))
 
-@api_router.post("/suppliers", response_model=SupplierOut)
-async def create_supplier(payload: SupplierIn, _: dict = Depends(require_admin)):
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Name required")
-    existing = await db.suppliers.find_one({"name": name})
-    if existing:
-        existing.pop("_id", None)
-        return existing
-    doc = {"id": new_id(), "name": name}
-    await db.suppliers.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
 
-@api_router.delete("/suppliers/{supplier_id}")
-async def delete_supplier(supplier_id: str, _: dict = Depends(require_admin)):
-    res = await db.suppliers.delete_one({"id": supplier_id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Supplier not found")
-    # Clear default_supplier_id from medicines and current-day logs stays assigned but ok
-    await db.medicines.update_many({"default_supplier_id": supplier_id}, {"$set": {"default_supplier_id": None}})
-    return {"ok": True}
-
-# ---------- Medicines ----------
-async def _decorate_medicine(m: dict) -> dict:
-    m.pop("_id", None)
-    if m.get("default_supplier_id"):
-        sup = await db.suppliers.find_one({"id": m["default_supplier_id"]}, {"_id": 0, "name": 1})
-        m["default_supplier_name"] = sup["name"] if sup else None
-    else:
-        m["default_supplier_name"] = None
-    return m
-
-@api_router.get("/medicines", response_model=List[MedicineOut])
-async def list_medicines(q: Optional[str] = None, limit: int = 500, _: dict = Depends(get_current_user)):
-    query = {}
-    if q:
-        pat = re.escape(q.strip())
-        query = {"$or": [
-            {"name": {"$regex": pat, "$options": "i"}},
-            {"company": {"$regex": pat, "$options": "i"}},
-        ]}
-    docs = await db.medicines.find(query).sort("name", 1).to_list(limit)
-    out = []
-    for d in docs:
-        out.append(await _decorate_medicine(d))
-    return out
-
-@api_router.get("/medicines/suggest")
-async def suggest_medicines(q: str, user: dict = Depends(get_current_user)):
-    if not q or len(q.strip()) < 1:
-        return []
-    pat = re.escape(q.strip())
-    docs = await db.medicines.find(
-        {"$or": [
-            {"name": {"$regex": pat, "$options": "i"}},
-            {"company": {"$regex": pat, "$options": "i"}},
-        ]}
-    ).limit(15).to_list(15)
-    # Employees never see supplier info
-    is_admin = user.get("role") == "admin"
-    out = []
-    for d in docs:
-        item = {"id": d["id"], "name": d["name"], "company": d.get("company", "")}
-        if is_admin:
-            item["default_supplier_id"] = d.get("default_supplier_id")
-        out.append(item)
-    return out
-
-@api_router.post("/medicines", response_model=MedicineOut)
-async def create_medicine(payload: MedicineIn, _: dict = Depends(require_admin)):
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Name required")
-    doc = {
-        "id": new_id(),
-        "name": name,
-        "company": (payload.company or "").strip(),
-        "default_supplier_id": payload.default_supplier_id,
-    }
-    await db.medicines.insert_one(doc)
-    return await _decorate_medicine(doc)
-
-@api_router.put("/medicines/{medicine_id}", response_model=MedicineOut)
-async def update_medicine(medicine_id: str, payload: MedicineIn, _: dict = Depends(require_admin)):
-    upd = {
-        "name": payload.name.strip(),
-        "company": (payload.company or "").strip(),
-        "default_supplier_id": payload.default_supplier_id,
-    }
-    res = await db.medicines.update_one({"id": medicine_id}, {"$set": upd})
-    if res.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
-    doc = await db.medicines.find_one({"id": medicine_id})
-    return await _decorate_medicine(doc)
-
-@api_router.delete("/medicines/{medicine_id}")
-async def delete_medicine(medicine_id: str, _: dict = Depends(require_admin)):
-    res = await db.medicines.delete_one({"id": medicine_id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
-    return {"ok": True}
-
-async def _get_or_create_supplier(name: str) -> Optional[str]:
+def _get_or_create_supplier(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    name = (name or "").strip()
     if not name:
         return None
-    name = name.strip()
-    if not name:
-        return None
-    existing = await db.suppliers.find_one({"name": name})
+    existing = conn.execute("SELECT id FROM suppliers WHERE name = ?", (name,)).fetchone()
     if existing:
         return existing["id"]
-    sup = {"id": new_id(), "name": name}
-    await db.suppliers.insert_one(sup)
-    return sup["id"]
+    sid = new_id()
+    conn.execute("INSERT INTO suppliers (id, name) VALUES (?, ?)", (sid, name))
+    return sid
 
-async def _import_rows(rows: list) -> dict:
-    """rows: list of dicts with keys medicine_name/name, company, supplier/default_supplier"""
+
+@api_router.post("/suppliers", response_model=SupplierOut)
+def create_supplier(payload: SupplierIn, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name required")
+    return {"id": _get_or_create_supplier(conn, name), "name": name}
+
+
+@api_router.delete("/suppliers/{supplier_id}")
+def delete_supplier(supplier_id: str, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    cur = conn.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    conn.execute("UPDATE medicines SET default_supplier_id = NULL WHERE default_supplier_id = ?", (supplier_id,))
+    # Items noted under this supplier move back to Unassigned instead of an orphan column.
+    conn.execute("UPDATE logs SET supplier_id = NULL, status = 'unassigned' WHERE supplier_id = ?", (supplier_id,))
+    return {"ok": True}
+
+
+# ---------- Medicines ----------
+MEDICINE_SELECT = """
+SELECT m.id, m.name, m.company, m.default_supplier_id, s.name AS default_supplier_name
+FROM medicines m LEFT JOIN suppliers s ON s.id = m.default_supplier_id
+"""
+
+
+def _get_medicine(conn: sqlite3.Connection, medicine_id: str) -> Optional[dict]:
+    return row(conn.execute(MEDICINE_SELECT + " WHERE m.id = ?", (medicine_id,)).fetchone())
+
+
+@api_router.get("/medicines", response_model=List[MedicineOut])
+def list_medicines(q: Optional[str] = None, limit: int = 500, _: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    sql, params = MEDICINE_SELECT, []
+    if q and q.strip():
+        pat = like_pattern(q)
+        sql += " WHERE m.name LIKE ? ESCAPE '\\' OR m.company LIKE ? ESCAPE '\\'"
+        params += [pat, pat]
+    sql += " ORDER BY m.name COLLATE NOCASE LIMIT ?"
+    params.append(max(1, min(limit, 20000)))
+    return rows(conn.execute(sql, params))
+
+
+@api_router.get("/medicines/suggest")
+def suggest_medicines(q: str = "", user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if not q.strip():
+        return []
+    pat = like_pattern(q)
+    found = rows(conn.execute(
+        "SELECT id, name, company, default_supplier_id FROM medicines "
+        "WHERE name LIKE ? ESCAPE '\\' OR company LIKE ? ESCAPE '\\' "
+        "ORDER BY name COLLATE NOCASE LIMIT 15",
+        (pat, pat),
+    ))
+    # Employees never see supplier info
+    if user.get("role") != "admin":
+        for f in found:
+            f.pop("default_supplier_id", None)
+    return found
+
+
+@api_router.post("/medicines", response_model=MedicineOut)
+def create_medicine(payload: MedicineIn, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name required")
+    mid = new_id()
+    conn.execute(
+        "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
+        (mid, name, (payload.company or "").strip(), payload.default_supplier_id),
+    )
+    return _get_medicine(conn, mid)
+
+
+@api_router.put("/medicines/{medicine_id}", response_model=MedicineOut)
+def update_medicine(medicine_id: str, payload: MedicineIn, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name required")
+    cur = conn.execute(
+        "UPDATE medicines SET name = ?, company = ?, default_supplier_id = ? WHERE id = ?",
+        (name, (payload.company or "").strip(), payload.default_supplier_id, medicine_id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _get_medicine(conn, medicine_id)
+
+
+@api_router.delete("/medicines/{medicine_id}")
+def delete_medicine(medicine_id: str, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    cur = conn.execute("DELETE FROM medicines WHERE id = ?", (medicine_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"ok": True}
+
+
+def _cell(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def _import_rows(conn: sqlite3.Connection, data: list) -> dict:
+    """data: list of dicts with keys name/medicine_name, company, supplier/default_supplier."""
     added, updated, skipped = 0, 0, 0
-    for r in rows:
-        name = (r.get("name") or r.get("medicine_name") or r.get("Medicine Name") or "").strip()
+    for r in data:
+        name = _cell(r.get("name") or r.get("medicine_name") or r.get("Medicine Name") or r.get("Name"))
         if not name:
             skipped += 1
             continue
-        company = (r.get("company") or r.get("Company") or "").strip()
-        sup_name = (r.get("supplier") or r.get("default_supplier") or r.get("Default Supplier") or r.get("Supplier") or "").strip()
-        supplier_id = await _get_or_create_supplier(sup_name) if sup_name else None
-        existing = await db.medicines.find_one({"name": name, "company": company})
+        company = _cell(r.get("company") or r.get("Company"))
+        sup_name = _cell(r.get("supplier") or r.get("default_supplier") or r.get("Default Supplier") or r.get("Supplier"))
+        supplier_id = _get_or_create_supplier(conn, sup_name) if sup_name else None
+        existing = conn.execute(
+            "SELECT id, default_supplier_id FROM medicines WHERE name = ? AND company = ?", (name, company)
+        ).fetchone()
         if existing:
-            await db.medicines.update_one(
-                {"id": existing["id"]},
-                {"$set": {"default_supplier_id": supplier_id or existing.get("default_supplier_id")}},
+            conn.execute(
+                "UPDATE medicines SET default_supplier_id = ? WHERE id = ?",
+                (supplier_id or existing["default_supplier_id"], existing["id"]),
             )
             updated += 1
         else:
-            doc = {"id": new_id(), "name": name, "company": company, "default_supplier_id": supplier_id}
-            await db.medicines.insert_one(doc)
+            conn.execute(
+                "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
+                (new_id(), name, company, supplier_id),
+            )
             added += 1
     return {"added": added, "updated": updated, "skipped": skipped}
 
+
 @api_router.post("/medicines/import/csv")
-async def import_csv(file: UploadFile = File(...), _: dict = Depends(require_admin)):
-    content = await file.read()
-    text = content.decode("utf-8-sig", errors="ignore")
+def import_csv(file: UploadFile = File(...), _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    text = file.file.read().decode("utf-8-sig", errors="ignore")
     reader = csv.DictReader(io.StringIO(text))
-    rows = [dict(r) for r in reader]
-    result = await _import_rows(rows)
-    return result
+    return _import_rows(conn, [dict(r) for r in reader])
+
 
 @api_router.post("/medicines/import/xlsx")
-async def import_xlsx(file: UploadFile = File(...), _: dict = Depends(require_admin)):
+def import_xlsx(file: UploadFile = File(...), _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
     from openpyxl import load_workbook
-    content = await file.read()
-    wb = load_workbook(filename=io.BytesIO(content), data_only=True)
+    wb = load_workbook(filename=io.BytesIO(file.file.read()), data_only=True, read_only=True)
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
     try:
-        headers = [str(h or "").strip() for h in next(rows_iter)]
+        headers = [_cell(h) for h in next(rows_iter)]
     except StopIteration:
         return {"added": 0, "updated": 0, "skipped": 0}
-    rows = []
-    for r in rows_iter:
-        rows.append({headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))})
-    result = await _import_rows(rows)
-    return result
+    data = [{headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))} for r in rows_iter]
+    return _import_rows(conn, data)
+
 
 @api_router.post("/medicines/import/paste")
-async def import_paste(payload: PasteImport, _: dict = Depends(require_admin)):
+def import_paste(payload: PasteImport, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
     lines = [l for l in payload.text.splitlines() if l.strip()]
     if not lines:
         return {"added": 0, "updated": 0, "skipped": 0}
-    delim = payload.delimiter or ","
-    reader = csv.reader(lines, delimiter=delim)
-    all_rows = list(reader)
-    # Detect header
+    all_rows = list(csv.reader(lines, delimiter=payload.delimiter or ","))
     header_candidates = [c.lower().strip() for c in all_rows[0]]
     header_keys = {"name", "medicine name", "medicine_name", "company", "supplier", "default supplier", "default_supplier"}
     if any(h in header_keys for h in header_candidates):
@@ -409,43 +547,36 @@ async def import_paste(payload: PasteImport, _: dict = Depends(require_admin)):
     else:
         headers = ["name", "company", "supplier"]
         data_rows = all_rows
-    rows = []
-    for r in data_rows:
-        rows.append({headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))})
-    result = await _import_rows(rows)
-    return result
+    data = [{headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))} for r in data_rows]
+    return _import_rows(conn, data)
 
-# ---------- Logs (Daily notes) ----------
+
+# ---------- Logs (daily short-item notes) ----------
+def _get_log(conn: sqlite3.Connection, log_id: str) -> Optional[dict]:
+    return row(conn.execute("SELECT * FROM logs WHERE id = ?", (log_id,)).fetchone())
+
+
 @api_router.post("/logs")
-async def create_log(payload: LogCreate, user: dict = Depends(get_current_user)):
+def create_log(payload: LogCreate, user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
     name = payload.medicine_name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Medicine name required")
-    quantity = payload.quantity.strip()
-    supplier_id = None
-    medicine_id = payload.medicine_id
-    company = ""
-    if medicine_id:
-        med = await db.medicines.find_one({"id": medicine_id})
-        if med:
-            name = med["name"]
-            company = med.get("company", "")
-            supplier_id = med.get("default_supplier_id")
-    else:
-        # Try to match by name
-        med = await db.medicines.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
-        if med:
-            medicine_id = med["id"]
-            name = med["name"]
-            company = med.get("company", "")
-            supplier_id = med.get("default_supplier_id")
+    med = None
+    if payload.medicine_id:
+        med = conn.execute("SELECT * FROM medicines WHERE id = ?", (payload.medicine_id,)).fetchone()
+    if med is None:
+        # Try an exact (case-insensitive) name match
+        med = conn.execute("SELECT * FROM medicines WHERE name = ? COLLATE NOCASE LIMIT 1", (name,)).fetchone()
+    medicine_id, company, supplier_id = None, "", None
+    if med is not None:
+        medicine_id, name, company, supplier_id = med["id"], med["name"], med["company"] or "", med["default_supplier_id"]
 
     doc = {
         "id": new_id(),
         "medicine_id": medicine_id,
         "medicine_name": name,
         "company": company,
-        "quantity": quantity,
+        "quantity": payload.quantity.strip(),
         "supplier_id": supplier_id,
         "date": today_str(),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -453,48 +584,50 @@ async def create_log(payload: LogCreate, user: dict = Depends(get_current_user))
         "added_by_name": user["name"],
         "status": "assigned" if supplier_id else "unassigned",
     }
-    await db.logs.insert_one(doc)
-    doc.pop("_id", None)
+    cols = ", ".join(doc.keys())
+    conn.execute(f"INSERT INTO logs ({cols}) VALUES ({', '.join('?' * len(doc))})", list(doc.values()))
     return doc
+
 
 @api_router.get("/logs")
-async def list_logs(date: Optional[str] = None, user: dict = Depends(get_current_user)):
-    d = date or today_str()
-    query = {"date": d}
+def list_logs(date: Optional[str] = None, user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    sql, params = "SELECT * FROM logs WHERE date = ?", [date or today_str()]
     if user.get("role") != "admin":
-        query["added_by_id"] = user["id"]
-    docs = await db.logs.find(query, {"_id": 0}).sort("created_at", -1).to_list(2000)
-    return docs
+        sql += " AND added_by_id = ?"
+        params.append(user["id"])
+    found = rows(conn.execute(sql + " ORDER BY created_at DESC", params))
+    if user.get("role") != "admin":
+        # Employees never see supplier info
+        for f in found:
+            f.pop("supplier_id", None)
+            f.pop("status", None)
+    return found
+
 
 @api_router.put("/logs/{log_id}/assign")
-async def assign_log_supplier(log_id: str, payload: LogAssignSupplier, _: dict = Depends(require_admin)):
-    log = await db.logs.find_one({"id": log_id})
+def assign_log_supplier(log_id: str, payload: LogAssignSupplier, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    log = _get_log(conn, log_id)
     if not log:
         raise HTTPException(status_code=404, detail="Not found")
-    upd = {
-        "supplier_id": payload.supplier_id,
-        "status": "assigned" if payload.supplier_id else "unassigned",
-    }
+    medicine_id = log["medicine_id"]
     if payload.remember and payload.supplier_id:
-        if log.get("medicine_id") and await db.medicines.find_one({"id": log["medicine_id"]}):
-            await db.medicines.update_one(
-                {"id": log["medicine_id"]}, {"$set": {"default_supplier_id": payload.supplier_id}}
-            )
+        if medicine_id and conn.execute("SELECT 1 FROM medicines WHERE id = ?", (medicine_id,)).fetchone():
+            conn.execute("UPDATE medicines SET default_supplier_id = ? WHERE id = ?", (payload.supplier_id, medicine_id))
         else:
-            med = {
-                "id": new_id(),
-                "name": log["medicine_name"],
-                "company": log.get("company", ""),
-                "default_supplier_id": payload.supplier_id,
-            }
-            await db.medicines.insert_one(med)
-            upd["medicine_id"] = med["id"]
-    await db.logs.update_one({"id": log_id}, {"$set": upd})
-    doc = await db.logs.find_one({"id": log_id}, {"_id": 0})
-    return doc
+            medicine_id = new_id()
+            conn.execute(
+                "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
+                (medicine_id, log["medicine_name"], log["company"] or "", payload.supplier_id),
+            )
+    conn.execute(
+        "UPDATE logs SET supplier_id = ?, status = ?, medicine_id = ? WHERE id = ?",
+        (payload.supplier_id, "assigned" if payload.supplier_id else "unassigned", medicine_id, log_id),
+    )
+    return _get_log(conn, log_id)
+
 
 @api_router.put("/logs/{log_id}")
-async def update_log(log_id: str, payload: LogUpdate, _: dict = Depends(require_admin)):
+def update_log(log_id: str, payload: LogUpdate, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
     upd = {}
     if payload.medicine_name is not None:
         name = payload.medicine_name.strip()
@@ -505,50 +638,62 @@ async def update_log(log_id: str, payload: LogUpdate, _: dict = Depends(require_
         upd["quantity"] = payload.quantity.strip()
     if not upd:
         raise HTTPException(status_code=400, detail="Nothing to update")
-    res = await db.logs.update_one({"id": log_id}, {"$set": upd})
-    if res.matched_count == 0:
+    sets = ", ".join(f"{k} = ?" for k in upd)
+    cur = conn.execute(f"UPDATE logs SET {sets} WHERE id = ?", list(upd.values()) + [log_id])
+    if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
-    return await db.logs.find_one({"id": log_id}, {"_id": 0})
+    return _get_log(conn, log_id)
+
+
+def _log_filter(date: Optional[str], supplier_id: Optional[str]):
+    sql, params = "date = ?", [date or today_str()]
+    if supplier_id == UNASSIGNED:
+        sql += " AND supplier_id IS NULL"
+    elif supplier_id:
+        sql += " AND supplier_id = ?"
+        params.append(supplier_id)
+    return sql, params
+
 
 @api_router.delete("/logs")
-async def delete_logs_bulk(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin)):
+def delete_logs_bulk(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
     """Delete every note for a day, or only those under one supplier
     (supplier_id='unassigned' targets the Unassigned column)."""
-    q = {"date": date or today_str()}
-    if supplier_id:
-        q["supplier_id"] = None if supplier_id == UNASSIGNED else supplier_id
-    res = await db.logs.delete_many(q)
-    return {"deleted": res.deleted_count}
+    where, params = _log_filter(date, supplier_id)
+    cur = conn.execute(f"DELETE FROM logs WHERE {where}", params)
+    return {"deleted": cur.rowcount}
+
 
 @api_router.delete("/logs/{log_id}")
-async def delete_log(log_id: str, user: dict = Depends(get_current_user)):
-    q = {"id": log_id}
+def delete_log(log_id: str, user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    sql, params = "DELETE FROM logs WHERE id = ?", [log_id]
     if user.get("role") != "admin":
-        q["added_by_id"] = user["id"]
-    res = await db.logs.delete_one(q)
-    if res.deleted_count == 0:
+        sql += " AND added_by_id = ?"
+        params.append(user["id"])
+    if conn.execute(sql, params).rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
 
-# ---------- Export ----------
-@api_router.get("/logs/export/text")
-async def export_text(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin)):
-    d = date or today_str()
-    q = {"date": d}
-    if supplier_id:
-        q["supplier_id"] = None if supplier_id == UNASSIGNED else supplier_id
-    logs = await db.logs.find(q, {"_id": 0}).to_list(5000)
-    suppliers = {s["id"]: s["name"] for s in await db.suppliers.find({}, {"_id": 0}).to_list(1000)}
 
-    # Group
+# ---------- Export ----------
+def _grouped_logs(conn: sqlite3.Connection, date: Optional[str], supplier_id: Optional[str]):
+    where, params = _log_filter(date, supplier_id)
+    logs = rows(conn.execute(f"SELECT * FROM logs WHERE {where} ORDER BY created_at", params))
+    suppliers = {s["id"]: s["name"] for s in rows(conn.execute("SELECT id, name FROM suppliers"))}
     grouped = {}
     for l in logs:
-        sid = l.get("supplier_id") or UNASSIGNED
-        grouped.setdefault(sid, []).append(l)
-
-    lines = [f"Order List — {d}", ""]
+        grouped.setdefault(l["supplier_id"] or UNASSIGNED, []).append(l)
+    named = []
     for sid, items in grouped.items():
-        sup_name = "Unassigned" if sid == UNASSIGNED else suppliers.get(sid, "Unknown")
+        named.append(("Unassigned" if sid == UNASSIGNED else suppliers.get(sid, "Unknown"), items))
+    return named
+
+
+@api_router.get("/logs/export/text")
+def export_text(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    d = date or today_str()
+    lines = [f"Order List — {d}", ""]
+    for sup_name, items in _grouped_logs(conn, d, supplier_id):
         lines.append(f"*{sup_name}*")
         for i, it in enumerate(items, 1):
             comp = f" ({it['company']})" if it.get("company") else ""
@@ -556,37 +701,25 @@ async def export_text(date: Optional[str] = None, supplier_id: Optional[str] = N
         lines.append("")
     return {"text": "\n".join(lines)}
 
-@api_router.get("/logs/export/pdf")
-async def export_pdf(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin)):
-    d = date or today_str()
-    q = {"date": d}
-    if supplier_id:
-        q["supplier_id"] = None if supplier_id == UNASSIGNED else supplier_id
-    logs = await db.logs.find(q, {"_id": 0}).sort("supplier_id", 1).to_list(5000)
-    suppliers = {s["id"]: s["name"] for s in await db.suppliers.find({}, {"_id": 0}).to_list(1000)}
 
-    grouped = {}
-    for l in logs:
-        sid = l.get("supplier_id") or UNASSIGNED
-        grouped.setdefault(sid, []).append(l)
+@api_router.get("/logs/export/pdf")
+def export_pdf(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    d = date or today_str()
+    grouped = _grouped_logs(conn, d, supplier_id)
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5*cm, bottomMargin=1.5*cm, leftMargin=1.5*cm, rightMargin=1.5*cm)
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm, leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("Title", parent=styles["Title"], textColor=colors.HexColor("#4A5D4E"), fontSize=22, spaceAfter=12)
     section_style = ParagraphStyle("Section", parent=styles["Heading2"], textColor=colors.HexColor("#2C312E"), fontSize=14, spaceBefore=14, spaceAfter=6)
-    story = []
-    story.append(Paragraph(f"Daily Order List", title_style))
-    story.append(Paragraph(f"Date: {d}", styles["Normal"]))
-    story.append(Spacer(1, 0.4*cm))
+    story = [Paragraph("Daily Order List", title_style), Paragraph(f"Date: {d}", styles["Normal"]), Spacer(1, 0.4 * cm)]
 
-    for sid, items in grouped.items():
-        sup_name = "Unassigned" if sid == UNASSIGNED else suppliers.get(sid, "Unknown")
-        story.append(Paragraph(sup_name, section_style))
+    for sup_name, items in grouped:
+        story.append(Paragraph(xml_escape(sup_name), section_style))
         data = [["#", "Medicine", "Company", "Qty left"]]
         for i, it in enumerate(items, 1):
             data.append([str(i), it["medicine_name"], it.get("company", ""), it.get("quantity", "")])
-        t = Table(data, colWidths=[1*cm, 8*cm, 5*cm, 4*cm])
+        t = Table(data, colWidths=[1 * cm, 8 * cm, 5 * cm, 4 * cm])
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4A5D4E")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -605,57 +738,59 @@ async def export_pdf(date: Optional[str] = None, supplier_id: Optional[str] = No
 
     doc.build(story)
     buf.seek(0)
-    fname = f"order-list-{d}.pdf"
-    return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={fname}"})
+    return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=order-list-{d}.pdf"})
+
 
 # ---------- Startup ----------
-async def seed_admin():
-    email = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower()
-    password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": email})
-    if existing is None:
-        await db.users.insert_one({
-            "id": new_id(),
-            "email": email,
-            "name": "Admin",
-            "role": "admin",
-            "password_hash": hash_password(password),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info(f"Seeded admin user {email}")
-    elif not verify_password(password, existing["password_hash"]):
-        await db.users.update_one({"email": email}, {"$set": {"password_hash": hash_password(password)}})
-        logger.info(f"Updated admin password for {email}")
+def seed_admin():
+    """Create the first admin account if there are no users yet."""
+    with open_db() as conn:
+        if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            return
+        username = (os.environ.get("ADMIN_USERNAME") or "admin").strip()
+        password = os.environ.get("ADMIN_PASSWORD")
+        note = ""
+        if not password:
+            password = secrets.token_urlsafe(8)
+            note = f"Username: {username}\nPassword: {password}\n"
+            (DATA_DIR / "FIRST_LOGIN.txt").write_text(
+                "Stockbook first admin login (delete this file after you change the password)\n" + note
+            )
+        conn.execute(
+            "INSERT INTO users (id, username, name, role, password_hash, created_at) VALUES (?, ?, ?, 'admin', ?, ?)",
+            (new_id(), username, "Admin", hash_password(password), datetime.now(timezone.utc).isoformat()),
+        )
+        logger.info("Created first admin user '%s'%s", username, " — see data/FIRST_LOGIN.txt" if note else "")
+
 
 @app.on_event("startup")
-async def on_startup():
-    await db.users.create_index("email", unique=True)
-    await db.medicines.create_index("name")
-    await db.suppliers.create_index("name", unique=True)
-    await db.logs.create_index("date")
-    await db.logs.create_index("supplier_id")
-    await seed_admin()
+def on_startup():
+    init_db()
+    seed_admin()
+    logger.info("Data file: %s", DB_PATH)
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
 
 app.include_router(api_router)
 
-# CORS
-frontend_url = os.environ.get("FRONTEND_URL", "*")
-cors_origins_env = os.environ.get("CORS_ORIGINS", "*")
-if cors_origins_env == "*":
-    allow_origins = ["*"]
-else:
-    allow_origins = cors_origins_env.split(",")
-if frontend_url and frontend_url != "*" and frontend_url not in allow_origins:
-    allow_origins.append(frontend_url)
+# Only needed when running the React dev server separately (npm start).
+_cors = os.environ.get("CORS_ORIGINS")
+if _cors:
+    from starlette.middleware.cors import CORSMiddleware
+    app.add_middleware(CORSMiddleware, allow_origins=_cors.split(","), allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=allow_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------- Serve the built web app ----------
+if (FRONTEND_DIR / "index.html").exists():
+    if (FRONTEND_DIR / "static").is_dir():
+        app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR / "static")), name="static")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = (FRONTEND_DIR / full_path).resolve()
+        if full_path and candidate.is_file() and FRONTEND_DIR.resolve() in candidate.parents:
+            return FileResponse(str(candidate))
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+else:
+    logger.warning("No built web app found in %s — only the API is available.", FRONTEND_DIR)
