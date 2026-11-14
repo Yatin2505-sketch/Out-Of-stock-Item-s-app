@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import io
+import re
 import csv
 import uuid
 import logging
@@ -140,6 +141,14 @@ class LogCreate(BaseModel):
 
 class LogAssignSupplier(BaseModel):
     supplier_id: Optional[str] = None  # None = unassigned
+    # Off by default: moving a card never changes the medicine database.
+    # When True, the chosen supplier is also saved as the medicine's default
+    # (creating the medicine if it was a brand-new, unknown item).
+    remember: bool = False
+
+class LogUpdate(BaseModel):
+    medicine_name: Optional[str] = None
+    quantity: Optional[str] = None
 
 class PasteImport(BaseModel):
     text: str
@@ -254,9 +263,10 @@ async def _decorate_medicine(m: dict) -> dict:
 async def list_medicines(q: Optional[str] = None, limit: int = 500, _: dict = Depends(get_current_user)):
     query = {}
     if q:
+        pat = re.escape(q.strip())
         query = {"$or": [
-            {"name": {"$regex": q, "$options": "i"}},
-            {"company": {"$regex": q, "$options": "i"}},
+            {"name": {"$regex": pat, "$options": "i"}},
+            {"company": {"$regex": pat, "$options": "i"}},
         ]}
     docs = await db.medicines.find(query).sort("name", 1).to_list(limit)
     out = []
@@ -268,10 +278,11 @@ async def list_medicines(q: Optional[str] = None, limit: int = 500, _: dict = De
 async def suggest_medicines(q: str, user: dict = Depends(get_current_user)):
     if not q or len(q.strip()) < 1:
         return []
+    pat = re.escape(q.strip())
     docs = await db.medicines.find(
         {"$or": [
-            {"name": {"$regex": q, "$options": "i"}},
-            {"company": {"$regex": q, "$options": "i"}},
+            {"name": {"$regex": pat, "$options": "i"}},
+            {"company": {"$regex": pat, "$options": "i"}},
         ]}
     ).limit(15).to_list(15)
     # Employees never see supplier info
@@ -422,7 +433,7 @@ async def create_log(payload: LogCreate, user: dict = Depends(get_current_user))
             supplier_id = med.get("default_supplier_id")
     else:
         # Try to match by name
-        med = await db.medicines.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
+        med = await db.medicines.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
         if med:
             medicine_id = med["id"]
             name = med["name"]
@@ -457,15 +468,57 @@ async def list_logs(date: Optional[str] = None, user: dict = Depends(get_current
 
 @api_router.put("/logs/{log_id}/assign")
 async def assign_log_supplier(log_id: str, payload: LogAssignSupplier, _: dict = Depends(require_admin)):
+    log = await db.logs.find_one({"id": log_id})
+    if not log:
+        raise HTTPException(status_code=404, detail="Not found")
     upd = {
         "supplier_id": payload.supplier_id,
         "status": "assigned" if payload.supplier_id else "unassigned",
     }
+    if payload.remember and payload.supplier_id:
+        if log.get("medicine_id") and await db.medicines.find_one({"id": log["medicine_id"]}):
+            await db.medicines.update_one(
+                {"id": log["medicine_id"]}, {"$set": {"default_supplier_id": payload.supplier_id}}
+            )
+        else:
+            med = {
+                "id": new_id(),
+                "name": log["medicine_name"],
+                "company": log.get("company", ""),
+                "default_supplier_id": payload.supplier_id,
+            }
+            await db.medicines.insert_one(med)
+            upd["medicine_id"] = med["id"]
+    await db.logs.update_one({"id": log_id}, {"$set": upd})
+    doc = await db.logs.find_one({"id": log_id}, {"_id": 0})
+    return doc
+
+@api_router.put("/logs/{log_id}")
+async def update_log(log_id: str, payload: LogUpdate, _: dict = Depends(require_admin)):
+    upd = {}
+    if payload.medicine_name is not None:
+        name = payload.medicine_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Medicine name required")
+        upd["medicine_name"] = name
+    if payload.quantity is not None:
+        upd["quantity"] = payload.quantity.strip()
+    if not upd:
+        raise HTTPException(status_code=400, detail="Nothing to update")
     res = await db.logs.update_one({"id": log_id}, {"$set": upd})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
-    doc = await db.logs.find_one({"id": log_id}, {"_id": 0})
-    return doc
+    return await db.logs.find_one({"id": log_id}, {"_id": 0})
+
+@api_router.delete("/logs")
+async def delete_logs_bulk(date: Optional[str] = None, supplier_id: Optional[str] = None, _: dict = Depends(require_admin)):
+    """Delete every note for a day, or only those under one supplier
+    (supplier_id='unassigned' targets the Unassigned column)."""
+    q = {"date": date or today_str()}
+    if supplier_id:
+        q["supplier_id"] = None if supplier_id == UNASSIGNED else supplier_id
+    res = await db.logs.delete_many(q)
+    return {"deleted": res.deleted_count}
 
 @api_router.delete("/logs/{log_id}")
 async def delete_log(log_id: str, user: dict = Depends(get_current_user)):
