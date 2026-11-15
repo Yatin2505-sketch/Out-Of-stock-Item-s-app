@@ -5,12 +5,11 @@ import { formatApiError } from "../lib/api";
 import { toast } from "sonner";
 import { Eye, EyeOff } from "lucide-react";
 
-const HERO_IMG = "https://images.unsplash.com/photo-1777620843115-a317c59007d6?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDV8MHwxfHNlYXJjaHwyfHxhcG90aGVjYXJ5JTIwYm90dGxlcyUyMHZpbnRhZ2V8ZW58MHx8fHwxNzg3Mjk1MDY2fDA&ixlib=rb-4.1.0&q=85";
 
 export default function Login() {
   const { user, login } = useAuth();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [showPw, setShowPw] = useState(false);
@@ -25,7 +24,7 @@ export default function Login() {
     setError("");
     setSubmitting(true);
     try {
-      const data = await login(email, password);
+      const data = await login(username, password);
       toast.success(`Welcome back, ${data.name}`);
       navigate(data.role === "admin" ? "/admin" : "/employee");
     } catch (err) {
@@ -39,7 +38,7 @@ export default function Login() {
     <div className="min-h-screen grid lg:grid-cols-2 bg-[#F9F8F6]">
       {/* Left visual */}
       <div className="relative hidden lg:block">
-        <img src={HERO_IMG} alt="Apothecary" className="absolute inset-0 w-full h-full object-cover" />
+        <div className="absolute inset-0 bg-[#3D4D40]" />
         <div className="absolute inset-0 bg-gradient-to-br from-[#2C312E]/70 via-[#4A5D4E]/50 to-transparent" />
         <div className="relative z-10 h-full flex flex-col justify-between p-14 text-white">
           <div>
@@ -65,16 +64,18 @@ export default function Login() {
           </div>
           <form onSubmit={handleSubmit} className="space-y-5" data-testid="login-form">
             <div>
-              <label className="block text-xs uppercase tracking-wider text-[#6B726C] mb-2">Email</label>
+              <label className="block text-xs uppercase tracking-wider text-[#6B726C] mb-2">Username</label>
               <input
                 data-testid="login-email"
-                type="email"
+                type="text"
+                autoCapitalize="none"
+                autoCorrect="off"
                 autoComplete="username"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
                 required
                 className="w-full px-4 py-3 rounded-xl bg-white border border-[#E5E1DB] focus:outline-none focus:ring-2 focus:ring-[#4A5D4E]/40 focus:border-[#4A5D4E]"
-                placeholder="you@pharmacy.com"
+                placeholder="e.g. ravi"
               />
             </div>
             <div>

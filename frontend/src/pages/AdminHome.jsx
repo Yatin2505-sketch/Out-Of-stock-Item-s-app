@@ -3,7 +3,7 @@ import AppShell from "../components/AppShell";
 import { api, formatApiError, API } from "../lib/api";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import { toast } from "sonner";
-import { Download, Copy, Calendar, Trash2, PackageOpen } from "lucide-react";
+import { Download, Copy, Calendar, Trash2, PackageOpen, Pencil, LayoutGrid, List, HelpCircle } from "lucide-react";
 import MedicineAutocomplete from "../components/MedicineAutocomplete";
 
 const UNASSIGNED = "unassigned";
@@ -11,7 +11,7 @@ const UNASSIGNED = "unassigned";
 export default function AdminHome() {
   const [suppliers, setSuppliers] = useState([]);
   const [logs, setLogs] = useState([]);
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; });
   const [loading, setLoading] = useState(true);
 
   // Admin quick add
@@ -19,6 +19,13 @@ export default function AdminHome() {
   const [selected, setSelected] = useState(null);
   const [quantity, setQuantity] = useState("");
   const [showQty, setShowQty] = useState(false);
+
+  // Views from the spec: Supplier list (board) / Short item list / Unclassified item list
+  const [view, setView] = useState("board");
+  // Edit dialog
+  const [editing, setEditing] = useState(null); // { id, medicine_name, quantity }
+  // Pending supplier choice per unclassified row: { [logId]: { supplierId, remember } }
+  const [classify, setClassify] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -59,11 +66,60 @@ export default function AdminHome() {
     );
     try {
       await api.put(`/logs/${draggableId}/assign`, { supplier_id: newSupplierId });
+      if (source.droppableId === UNASSIGNED && newSupplierId) {
+        const sup = suppliers.find((s) => s.id === newSupplierId);
+        toast.success(`Moved to ${sup?.name || "supplier"} for today`, {
+          action: {
+            label: "Always use this supplier",
+            onClick: () => assign(draggableId, newSupplierId, true),
+          },
+        });
+      }
     } catch (err) {
       toast.error("Failed to move");
       load();
     }
   };
+
+  const assign = async (logId, supplierId, remember) => {
+    try {
+      const { data } = await api.put(`/logs/${logId}/assign`, { supplier_id: supplierId, remember });
+      setLogs((prev) => prev.map((l) => (l.id === logId ? data : l)));
+      toast.success(remember ? "Saved as default supplier" : "Supplier set for today");
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail));
+    }
+  };
+
+  const saveEdit = async () => {
+    try {
+      const { data } = await api.put(`/logs/${editing.id}`, {
+        medicine_name: editing.medicine_name,
+        quantity: editing.quantity,
+      });
+      setLogs((prev) => prev.map((l) => (l.id === data.id ? data : l)));
+      setEditing(null);
+      toast.success("Updated");
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail));
+    }
+  };
+
+  const bulkDelete = async (supplierId = null, label = "all items for this day") => {
+    if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
+    try {
+      const params = { date };
+      if (supplierId) params.supplier_id = supplierId;
+      const { data } = await api.delete(`/logs`, { params });
+      toast.success(`Deleted ${data.deleted} item${data.deleted === 1 ? "" : "s"}`);
+      load();
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail));
+    }
+  };
+
+  const supplierName = (id) => (id ? suppliers.find((s) => s.id === id)?.name || "Unknown" : "Unassigned");
+  const unassignedLogs = logs.filter((l) => !l.supplier_id);
 
   const removeLog = async (id) => {
     try { await api.delete(`/logs/${id}`); setLogs((p) => p.filter((l) => l.id !== id)); }
@@ -134,6 +190,14 @@ export default function AdminHome() {
             >
               <Download size={16} /> Download PDF
             </button>
+            <button
+              data-testid="delete-all-btn"
+              onClick={() => bulkDelete()}
+              disabled={logs.length === 0}
+              className="pill-btn inline-flex items-center gap-2 px-5 py-2.5 border border-[#E5E1DB] bg-white text-sm text-[#B04A3A] hover:bg-[#F7E9E4] disabled:opacity-40"
+            >
+              <Trash2 size={16} /> Delete all
+            </button>
           </div>
         </div>
 
@@ -143,9 +207,133 @@ export default function AdminHome() {
           <MedicineAutocomplete value={name} onChange={setName} onSelect={handleSelect} testid="admin-medicine-input" />
         </div>
 
-        {/* Kanban */}
+        {/* View tabs */}
+        <div className="flex flex-wrap gap-2 mb-6" role="tablist">
+          {[
+            { id: "board", label: "Supplier list", icon: LayoutGrid, count: null },
+            { id: "list", label: "Short item list", icon: List, count: logs.length },
+            { id: "unclassified", label: "Unclassified items", icon: HelpCircle, count: unassignedLogs.length },
+          ].map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={view === t.id}
+              data-testid={`view-tab-${t.id}`}
+              onClick={() => setView(t.id)}
+              className={`pill-btn inline-flex items-center gap-2 px-4 py-2 text-sm border ${
+                view === t.id ? "bg-[#2C312E] text-white border-[#2C312E]" : "bg-white border-[#E5E1DB] text-[#2C312E] hover:bg-[#F2EFEB]"
+              }`}
+            >
+              <t.icon size={15} /> {t.label}
+              {t.count !== null && <span className="text-xs opacity-70">({t.count})</span>}
+            </button>
+          ))}
+        </div>
+
         {loading ? (
           <div className="text-[#6B726C] font-serif text-2xl py-20 text-center">Loading…</div>
+        ) : view === "list" ? (
+          <div className="bg-white rounded-2xl border border-[#E5E1DB] overflow-x-auto" data-testid="short-item-list">
+            <table className="w-full text-sm">
+              <thead className="bg-[#F2EFEB] text-left text-[11px] uppercase tracking-wider text-[#6B726C]">
+                <tr>
+                  <th className="px-4 py-3">Item name</th>
+                  <th className="px-4 py-3">Quantity left</th>
+                  <th className="px-4 py-3">Supplier</th>
+                  <th className="px-4 py-3">Added by</th>
+                  <th className="px-4 py-3">Date</th>
+                  <th className="px-4 py-3"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {logs.length === 0 && (
+                  <tr><td colSpan={6} className="px-4 py-10 text-center text-[#6B726C]">No items noted on this day.</td></tr>
+                )}
+                {logs.map((l) => (
+                  <tr key={l.id} className="border-t border-[#E5E1DB]" data-testid={`list-row-${l.id}`}>
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-[#2C312E]">{l.medicine_name}</div>
+                      {l.company && <div className="text-xs text-[#6B726C]">{l.company}</div>}
+                    </td>
+                    <td className="px-4 py-3">{l.quantity || "—"}</td>
+                    <td className="px-4 py-3">{supplierName(l.supplier_id)}</td>
+                    <td className="px-4 py-3">{l.added_by_name}</td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      {l.date}
+                      {l.created_at && (
+                        <span className="text-xs text-[#6B726C] ml-1">
+                          {new Date(l.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                      <button onClick={() => setEditing({ id: l.id, medicine_name: l.medicine_name, quantity: l.quantity || "" })} className="p-1.5 rounded-full text-[#6B726C] hover:text-[#2C312E] hover:bg-[#F2EFEB]" title="Edit"><Pencil size={14} /></button>
+                      <button onClick={() => removeLog(l.id)} className="p-1.5 rounded-full text-[#6B726C] hover:text-[#B04A3A] hover:bg-[#F7E9E4]" title="Delete"><Trash2 size={14} /></button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : view === "unclassified" ? (
+          <div className="bg-white rounded-2xl border border-[#E5E1DB] overflow-x-auto" data-testid="unclassified-list">
+            <table className="w-full text-sm">
+              <thead className="bg-[#F2EFEB] text-left text-[11px] uppercase tracking-wider text-[#6B726C]">
+                <tr>
+                  <th className="px-4 py-3">Item name</th>
+                  <th className="px-4 py-3">Quantity left</th>
+                  <th className="px-4 py-3">Added by</th>
+                  <th className="px-4 py-3">Choose supplier</th>
+                  <th className="px-4 py-3"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {unassignedLogs.length === 0 && (
+                  <tr><td colSpan={5} className="px-4 py-10 text-center text-[#6B726C]">Nothing unclassified — every item has a supplier.</td></tr>
+                )}
+                {unassignedLogs.map((l) => {
+                  const c = classify[l.id] || { supplierId: "", remember: true };
+                  const setC = (patch) => setClassify((p) => ({ ...p, [l.id]: { ...c, ...patch } }));
+                  return (
+                    <tr key={l.id} className="border-t border-[#E5E1DB]" data-testid={`unclassified-row-${l.id}`}>
+                      <td className="px-4 py-3">
+                        <div className="font-medium text-[#2C312E]">{l.medicine_name}</div>
+                        {!l.medicine_id && <div className="text-[11px] text-[#B04A3A]">Not in medicine database</div>}
+                      </td>
+                      <td className="px-4 py-3">{l.quantity || "—"}</td>
+                      <td className="px-4 py-3">{l.added_by_name}</td>
+                      <td className="px-4 py-3">
+                        <select
+                          data-testid={`classify-select-${l.id}`}
+                          value={c.supplierId}
+                          onChange={(e) => setC({ supplierId: e.target.value })}
+                          className="px-3 py-2 rounded-lg border border-[#E5E1DB] bg-white"
+                        >
+                          <option value="">Select…</option>
+                          {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </select>
+                        <label className="ml-3 inline-flex items-center gap-1.5 text-xs text-[#6B726C]">
+                          <input type="checkbox" checked={c.remember} onChange={(e) => setC({ remember: e.target.checked })} />
+                          Remember for next time
+                        </label>
+                      </td>
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                        <button
+                          data-testid={`classify-save-${l.id}`}
+                          disabled={!c.supplierId}
+                          onClick={() => assign(l.id, c.supplierId, c.remember)}
+                          className="pill-btn px-4 py-1.5 bg-[#4A5D4E] text-white text-xs disabled:opacity-40"
+                        >
+                          Assign
+                        </button>
+                        <button onClick={() => removeLog(l.id)} className="ml-1 p-1.5 rounded-full text-[#6B726C] hover:text-[#B04A3A] hover:bg-[#F7E9E4]" title="Delete"><Trash2 size={14} /></button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         ) : (
           <DragDropContext onDragEnd={onDragEnd}>
             <div className="flex gap-5 overflow-x-auto pb-6" data-testid="kanban-board">
@@ -175,6 +363,15 @@ export default function AdminHome() {
                               title="Copy this column"
                             >
                               <Copy size={14} />
+                            </button>
+                            <button
+                              data-testid={`clear-column-${col.id}`}
+                              onClick={() => bulkDelete(col.id, `all ${col.items.length} item(s) under ${col.name}`)}
+                              disabled={col.items.length === 0}
+                              className="p-1.5 rounded-full text-[#6B726C] hover:text-[#B04A3A] hover:bg-white disabled:opacity-30"
+                              title="Delete all items in this column"
+                            >
+                              <Trash2 size={14} />
                             </button>
                           </div>
                         </div>
@@ -206,6 +403,15 @@ export default function AdminHome() {
                                     </div>
                                     <div className="text-[11px] text-[#6B726C] mt-2">by {item.added_by_name}</div>
                                   </div>
+                                  <div className="flex flex-col">
+                                  <button
+                                    data-testid={`edit-log-${item.id}`}
+                                    onClick={() => setEditing({ id: item.id, medicine_name: item.medicine_name, quantity: item.quantity || "" })}
+                                    className="p-1.5 rounded-full text-[#6B726C] hover:text-[#2C312E] hover:bg-[#F2EFEB]"
+                                    title="Edit"
+                                  >
+                                    <Pencil size={14} />
+                                  </button>
                                   <button
                                     data-testid={`delete-log-${item.id}`}
                                     onClick={() => removeLog(item.id)}
@@ -213,6 +419,7 @@ export default function AdminHome() {
                                   >
                                     <Trash2 size={14} />
                                   </button>
+                                  </div>
                                 </div>
                               </div>
                             )}
@@ -246,6 +453,31 @@ export default function AdminHome() {
             <div className="mt-6 flex justify-end gap-3">
               <button onClick={() => setShowQty(false)} className="pill-btn px-5 py-2.5 border border-[#E5E1DB]">Cancel</button>
               <button data-testid="admin-submit-quantity" onClick={submitAdd} className="pill-btn px-6 py-2.5 bg-[#4A5D4E] text-white">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editing && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#2C312E]/40 backdrop-blur-sm px-4">
+          <div className="bg-white rounded-3xl border border-[#E5E1DB] max-w-md w-full p-8" data-testid="edit-log-dialog">
+            <div className="text-xs uppercase tracking-[0.25em] text-[#6B726C]">Edit entry</div>
+            <label className="block mt-6 text-xs text-[#6B726C]">Medicine name</label>
+            <input
+              data-testid="edit-log-name"
+              value={editing.medicine_name}
+              onChange={(e) => setEditing({ ...editing, medicine_name: e.target.value })}
+              className="mt-1 w-full px-4 py-3 rounded-xl bg-white border border-[#E5E1DB] focus:outline-none focus:ring-2 focus:ring-[#4A5D4E]/40"
+            />
+            <label className="block mt-4 text-xs text-[#6B726C]">Quantity left</label>
+            <input
+              data-testid="edit-log-quantity"
+              value={editing.quantity}
+              onChange={(e) => setEditing({ ...editing, quantity: e.target.value })}
+              className="mt-1 w-full px-4 py-3 rounded-xl bg-white border border-[#E5E1DB] focus:outline-none focus:ring-2 focus:ring-[#4A5D4E]/40"
+            />
+            <div className="mt-6 flex justify-end gap-3">
+              <button onClick={() => setEditing(null)} className="pill-btn px-5 py-2.5 border border-[#E5E1DB]">Cancel</button>
+              <button data-testid="edit-log-save" onClick={saveEdit} className="pill-btn px-6 py-2.5 bg-[#4A5D4E] text-white">Save</button>
             </div>
           </div>
         </div>
