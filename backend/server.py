@@ -23,7 +23,7 @@ from typing import List, Optional
 
 import bcrypt
 import jwt
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,6 +34,8 @@ from reportlab.lib import colors
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from xml.sax.saxutils import escape as xml_escape
+
+from tally_import import parse_purchase_bills
 
 JWT_ALGORITHM = "HS256"
 UNASSIGNED = "unassigned"
@@ -82,6 +84,21 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_date ON logs(date);
 CREATE INDEX IF NOT EXISTS idx_logs_supplier ON logs(supplier_id);
+-- Every supplier a medicine can come from (one medicine may have several).
+-- bills = number of Tally purchase bills seen; the default stays in medicines.default_supplier_id.
+CREATE TABLE IF NOT EXISTS medicine_suppliers (
+    medicine_id TEXT NOT NULL,
+    supplier_id TEXT NOT NULL,
+    bills INTEGER NOT NULL DEFAULT 0,
+    last_date TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (medicine_id, supplier_id)
+);
+CREATE INDEX IF NOT EXISTS idx_medsup_supplier ON medicine_suppliers(supplier_id);
+-- Tally bills already imported, so importing the same file twice doesn't double-count.
+CREATE TABLE IF NOT EXISTS tally_bills (
+    key TEXT PRIMARY KEY,
+    imported_at TEXT NOT NULL
+);
 """
 
 
@@ -113,6 +130,11 @@ def init_db():
     with open_db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        # Make sure every existing default supplier is also in the supplier list
+        conn.execute(
+            "INSERT OR IGNORE INTO medicine_suppliers (medicine_id, supplier_id) "
+            "SELECT id, default_supplier_id FROM medicines WHERE default_supplier_id IS NOT NULL"
+        )
 
 
 def row(r: Optional[sqlite3.Row]) -> Optional[dict]:
@@ -248,6 +270,8 @@ class MedicineOut(BaseModel):
     company: Optional[str] = ""
     default_supplier_id: Optional[str] = None
     default_supplier_name: Optional[str] = None
+    # Other suppliers this medicine is also bought from (names), e.g. from Tally bills
+    other_suppliers: List[str] = []
 
 
 class LogCreate(BaseModel):
@@ -262,6 +286,11 @@ class LogAssignSupplier(BaseModel):
     # When True, the chosen supplier is also saved as the medicine's default
     # (creating the medicine if it was a brand-new, unknown item).
     remember: bool = False
+
+
+class LogCopy(BaseModel):
+    # Where to put the copy: a supplier id, "unassigned", or omitted = same column
+    supplier_id: Optional[str] = None
 
 
 class LogUpdate(BaseModel):
@@ -372,6 +401,14 @@ def list_suppliers(_: dict = Depends(get_current_user), conn: sqlite3.Connection
     return rows(conn.execute("SELECT id, name FROM suppliers ORDER BY name COLLATE NOCASE"))
 
 
+def _link_supplier(conn: sqlite3.Connection, medicine_id: Optional[str], supplier_id: Optional[str]):
+    if medicine_id and supplier_id:
+        conn.execute(
+            "INSERT OR IGNORE INTO medicine_suppliers (medicine_id, supplier_id) VALUES (?, ?)",
+            (medicine_id, supplier_id),
+        )
+
+
 def _get_or_create_supplier(conn: sqlite3.Connection, name: str) -> Optional[str]:
     name = (name or "").strip()
     if not name:
@@ -398,6 +435,7 @@ def delete_supplier(supplier_id: str, _: dict = Depends(require_admin), conn: sq
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Supplier not found")
     conn.execute("UPDATE medicines SET default_supplier_id = NULL WHERE default_supplier_id = ?", (supplier_id,))
+    conn.execute("DELETE FROM medicine_suppliers WHERE supplier_id = ?", (supplier_id,))
     # Items noted under this supplier move back to Unassigned instead of an orphan column.
     conn.execute("UPDATE logs SET supplier_id = NULL, status = 'unassigned' WHERE supplier_id = ?", (supplier_id,))
     return {"ok": True}
@@ -410,8 +448,31 @@ FROM medicines m LEFT JOIN suppliers s ON s.id = m.default_supplier_id
 """
 
 
+def _supplier_links(conn: sqlite3.Connection, medicine_ids: List[str]) -> dict:
+    """medicine_id -> [{id, name}] of every linked supplier, most-bought first."""
+    out = {}
+    ids = list({i for i in medicine_ids if i})
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        q = ("SELECT ms.medicine_id, s.id, s.name FROM medicine_suppliers ms "
+             "JOIN suppliers s ON s.id = ms.supplier_id "
+             f"WHERE ms.medicine_id IN ({','.join('?' * len(chunk))}) "
+             "ORDER BY ms.bills DESC, ms.last_date DESC, s.name COLLATE NOCASE")
+        for r in conn.execute(q, chunk):
+            out.setdefault(r["medicine_id"], []).append({"id": r["id"], "name": r["name"]})
+    return out
+
+
+def _with_other_suppliers(conn: sqlite3.Connection, meds: List[dict]) -> List[dict]:
+    links = _supplier_links(conn, [m["id"] for m in meds])
+    for m in meds:
+        m["other_suppliers"] = [s["name"] for s in links.get(m["id"], []) if s["id"] != m.get("default_supplier_id")]
+    return meds
+
+
 def _get_medicine(conn: sqlite3.Connection, medicine_id: str) -> Optional[dict]:
-    return row(conn.execute(MEDICINE_SELECT + " WHERE m.id = ?", (medicine_id,)).fetchone())
+    m = row(conn.execute(MEDICINE_SELECT + " WHERE m.id = ?", (medicine_id,)).fetchone())
+    return _with_other_suppliers(conn, [m])[0] if m else None
 
 
 @api_router.get("/medicines", response_model=List[MedicineOut])
@@ -423,7 +484,7 @@ def list_medicines(q: Optional[str] = None, limit: int = 500, _: dict = Depends(
         params += [pat, pat]
     sql += " ORDER BY m.name COLLATE NOCASE LIMIT ?"
     params.append(max(1, min(limit, 20000)))
-    return rows(conn.execute(sql, params))
+    return _with_other_suppliers(conn, rows(conn.execute(sql, params)))
 
 
 @api_router.get("/medicines/suggest")
@@ -454,6 +515,7 @@ def create_medicine(payload: MedicineIn, _: dict = Depends(require_admin), conn:
         "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
         (mid, name, (payload.company or "").strip(), payload.default_supplier_id),
     )
+    _link_supplier(conn, mid, payload.default_supplier_id)
     return _get_medicine(conn, mid)
 
 
@@ -468,6 +530,7 @@ def update_medicine(medicine_id: str, payload: MedicineIn, _: dict = Depends(req
     )
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
+    _link_supplier(conn, medicine_id, payload.default_supplier_id)
     return _get_medicine(conn, medicine_id)
 
 
@@ -476,6 +539,7 @@ def delete_medicine(medicine_id: str, _: dict = Depends(require_admin), conn: sq
     cur = conn.execute("DELETE FROM medicines WHERE id = ?", (medicine_id,))
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
+    conn.execute("DELETE FROM medicine_suppliers WHERE medicine_id = ?", (medicine_id,))
     return {"ok": True}
 
 
@@ -502,12 +566,15 @@ def _import_rows(conn: sqlite3.Connection, data: list) -> dict:
                 "UPDATE medicines SET default_supplier_id = ? WHERE id = ?",
                 (supplier_id or existing["default_supplier_id"], existing["id"]),
             )
+            _link_supplier(conn, existing["id"], supplier_id)
             updated += 1
         else:
+            mid = new_id()
             conn.execute(
                 "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
-                (new_id(), name, company, supplier_id),
+                (mid, name, company, supplier_id),
             )
+            _link_supplier(conn, mid, supplier_id)
             added += 1
     return {"added": added, "updated": updated, "skipped": skipped}
 
@@ -551,7 +618,88 @@ def import_paste(payload: PasteImport, _: dict = Depends(require_admin), conn: s
     return _import_rows(conn, data)
 
 
+@api_router.post("/medicines/import/tally")
+def import_tally(
+    file: UploadFile = File(...),
+    update_defaults: bool = Form(False),
+    _: dict = Depends(require_admin),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Learn which items come from which party, from Tally Prime purchase bills (XML export).
+
+    Every party an item was bought from is remembered. The default supplier is
+    only set for items that don't have one yet, unless update_defaults is on;
+    then it becomes the party with the most bills.
+    """
+    raw = file.file.read()
+    try:
+        bills = list(parse_purchase_bills(raw))
+    except Exception as e:  # malformed / not a Tally XML file
+        logger.warning("Tally import failed: %s", e)
+        raise HTTPException(status_code=400, detail="Could not read this file. Please export from Tally as XML (Data Interchange).")
+    if not bills:
+        raise HTTPException(status_code=400, detail="No purchase bills with items were found in this file.")
+
+    result = {"bills_found": len(bills), "bills_new": 0, "bills_already_imported": 0,
+              "new_medicines": 0, "new_suppliers": 0, "links": 0, "defaults_set": 0}
+    known_suppliers = {r["name"] for r in conn.execute("SELECT name FROM suppliers")}
+    touched = set()
+    now = datetime.now(timezone.utc).isoformat()
+    for bill in bills:
+        if conn.execute("SELECT 1 FROM tally_bills WHERE key = ?", (bill.key,)).fetchone():
+            result["bills_already_imported"] += 1
+            continue
+        conn.execute("INSERT INTO tally_bills (key, imported_at) VALUES (?, ?)", (bill.key, now))
+        result["bills_new"] += 1
+        if bill.party not in known_suppliers:
+            known_suppliers.add(bill.party)
+            result["new_suppliers"] += 1
+        sid = _get_or_create_supplier(conn, bill.party)
+        for item in bill.items:
+            med = conn.execute("SELECT id FROM medicines WHERE name = ? COLLATE NOCASE LIMIT 1", (item,)).fetchone()
+            if med:
+                mid = med["id"]
+            else:
+                mid = new_id()
+                conn.execute("INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, '', NULL)", (mid, item))
+                result["new_medicines"] += 1
+            existed = conn.execute(
+                "SELECT 1 FROM medicine_suppliers WHERE medicine_id = ? AND supplier_id = ?", (mid, sid)
+            ).fetchone()
+            if existed:
+                conn.execute(
+                    "UPDATE medicine_suppliers SET bills = bills + 1, last_date = MAX(last_date, ?) "
+                    "WHERE medicine_id = ? AND supplier_id = ?", (bill.date, mid, sid))
+            else:
+                conn.execute(
+                    "INSERT INTO medicine_suppliers (medicine_id, supplier_id, bills, last_date) VALUES (?, ?, 1, ?)",
+                    (mid, sid, bill.date))
+                result["links"] += 1
+            touched.add(mid)
+
+    for mid in touched:
+        current = conn.execute("SELECT default_supplier_id FROM medicines WHERE id = ?", (mid,)).fetchone()
+        if current["default_supplier_id"] and not update_defaults:
+            continue
+        top = conn.execute(
+            "SELECT supplier_id FROM medicine_suppliers WHERE medicine_id = ? "
+            "ORDER BY bills DESC, last_date DESC LIMIT 1", (mid,)
+        ).fetchone()
+        if top and top["supplier_id"] != current["default_supplier_id"]:
+            conn.execute("UPDATE medicines SET default_supplier_id = ? WHERE id = ?", (top["supplier_id"], mid))
+            result["defaults_set"] += 1
+    return result
+
+
 # ---------- Logs (daily short-item notes) ----------
+def _add_alt_suppliers(conn: sqlite3.Connection, logs: List[dict]) -> List[dict]:
+    """Admin only: the other suppliers this medicine can also be ordered from."""
+    links = _supplier_links(conn, [l["medicine_id"] for l in logs])
+    for l in logs:
+        l["alt_suppliers"] = [s for s in links.get(l["medicine_id"], []) if s["id"] != l["supplier_id"]]
+    return logs
+
+
 def _get_log(conn: sqlite3.Connection, log_id: str) -> Optional[dict]:
     return row(conn.execute("SELECT * FROM logs WHERE id = ?", (log_id,)).fetchone())
 
@@ -596,7 +744,9 @@ def list_logs(date: Optional[str] = None, user: dict = Depends(get_current_user)
         sql += " AND added_by_id = ?"
         params.append(user["id"])
     found = rows(conn.execute(sql + " ORDER BY created_at DESC", params))
-    if user.get("role") != "admin":
+    if user.get("role") == "admin":
+        _add_alt_suppliers(conn, found)
+    else:
         # Employees never see supplier info
         for f in found:
             f.pop("supplier_id", None)
@@ -619,11 +769,12 @@ def assign_log_supplier(log_id: str, payload: LogAssignSupplier, _: dict = Depen
                 "INSERT INTO medicines (id, name, company, default_supplier_id) VALUES (?, ?, ?, ?)",
                 (medicine_id, log["medicine_name"], log["company"] or "", payload.supplier_id),
             )
+        _link_supplier(conn, medicine_id, payload.supplier_id)
     conn.execute(
         "UPDATE logs SET supplier_id = ?, status = ?, medicine_id = ? WHERE id = ?",
         (payload.supplier_id, "assigned" if payload.supplier_id else "unassigned", medicine_id, log_id),
     )
-    return _get_log(conn, log_id)
+    return _add_alt_suppliers(conn, [_get_log(conn, log_id)])[0]
 
 
 @api_router.put("/logs/{log_id}")
@@ -642,7 +793,34 @@ def update_log(log_id: str, payload: LogUpdate, _: dict = Depends(require_admin)
     cur = conn.execute(f"UPDATE logs SET {sets} WHERE id = ?", list(upd.values()) + [log_id])
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
-    return _get_log(conn, log_id)
+    return _add_alt_suppliers(conn, [_get_log(conn, log_id)])[0]
+
+
+@api_router.post("/logs/{log_id}/copy")
+def copy_log(log_id: str, payload: LogCopy, _: dict = Depends(require_admin), conn: sqlite3.Connection = Depends(get_db)):
+    """Duplicate an entry, e.g. to order the same medicine from a second supplier.
+    A copy never changes the medicine's default supplier."""
+    log = _get_log(conn, log_id)
+    if not log:
+        raise HTTPException(status_code=404, detail="Not found")
+    if payload.supplier_id is None:
+        supplier_id = log["supplier_id"]
+    elif payload.supplier_id == UNASSIGNED:
+        supplier_id = None
+    else:
+        if not conn.execute("SELECT 1 FROM suppliers WHERE id = ?", (payload.supplier_id,)).fetchone():
+            raise HTTPException(status_code=400, detail="Supplier not found")
+        supplier_id = payload.supplier_id
+    doc = dict(log)
+    doc.update({
+        "id": new_id(),
+        "supplier_id": supplier_id,
+        "status": "assigned" if supplier_id else "unassigned",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    cols = ", ".join(doc.keys())
+    conn.execute(f"INSERT INTO logs ({cols}) VALUES ({', '.join('?' * len(doc))})", list(doc.values()))
+    return _add_alt_suppliers(conn, [doc])[0]
 
 
 def _log_filter(date: Optional[str], supplier_id: Optional[str]):

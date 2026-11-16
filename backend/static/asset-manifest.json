@@ -1,7 +1,7 @@
 {
   "files": {
-    "main.css": "/static/css/main.d800c12a.css",
-    "main.js": "/static/js/main.bbc67f39.js",
+    "main.css": "/static/css/main.dd5bfc3d.css",
+    "main.js": "/static/js/main.bf0fe896.js",
     "static/media/cormorant-garamond-latin-500-normal.woff": "/static/media/cormorant-garamond-latin-500-normal.386b16016e3443b93cb5.woff",
     "static/media/cormorant-garamond-latin-600-normal.woff": "/static/media/cormorant-garamond-latin-600-normal.53d922b52431a18a848c.woff",
     "static/media/cormorant-garamond-latin-400-normal.woff": "/static/media/cormorant-garamond-latin-400-normal.411da0b03f7b5266c0aa.woff",
@@ -105,7 +105,7 @@
     "index.html": "/index.html"
   },
   "entrypoints": [
-    "static/css/main.d800c12a.css",
-    "static/js/main.bbc67f39.js"
+    "static/css/main.dd5bfc3d.css",
+    "static/js/main.bf0fe896.js"
   ]
 }

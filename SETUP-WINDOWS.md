@@ -65,8 +65,13 @@ You need:
 1. **Settings → Team accounts:** create a login for your father and one for each employee
    (choose **Employee** for staff).
 2. **Settings → Suppliers:** add your suppliers. *(Optional: importing from Tally creates them automatically.)*
-3. **Medicine Database → Import:** upload your Tally export (Excel or CSV).
-   The first row should have the column names **Name**, **Company** and **Supplier**.
+3. **Medicine Database → Import from Tally:** this learns which item comes from which party
+   using your purchase bills. In Tally Prime: **Gateway of Tally → Alt+E (Export) → Transactions**,
+   choose voucher type **Purchase**, choose the dates, set **File Format: XML (Data Interchange)**, then **Send**.
+   Pick that `.xml` file in the app. If an item comes from several parties, all of them are remembered.
+   The most-used party becomes the default, and the others show as **"Also from"** on the board.
+   Importing the same file again is safe, because bills are never counted twice.
+4. *(Optional)* **Import CSV/Excel** still works for a plain list with the columns **Name**, **Company** and **Supplier**.
 
 ## Part 6 — Use it from anywhere (home, mobile data)
 

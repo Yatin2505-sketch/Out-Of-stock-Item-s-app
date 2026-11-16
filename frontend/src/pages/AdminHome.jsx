@@ -3,7 +3,7 @@ import AppShell from "../components/AppShell";
 import { api, formatApiError, API } from "../lib/api";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import { toast } from "sonner";
-import { Download, Copy, Calendar, Trash2, PackageOpen, Pencil, LayoutGrid, List, HelpCircle } from "lucide-react";
+import { Download, Copy, CopyPlus, Calendar, Trash2, PackageOpen, Pencil, LayoutGrid, List, HelpCircle, Plus } from "lucide-react";
 import MedicineAutocomplete from "../components/MedicineAutocomplete";
 
 const UNASSIGNED = "unassigned";
@@ -65,7 +65,8 @@ export default function AdminHome() {
       prev.map((l) => (l.id === draggableId ? { ...l, supplier_id: newSupplierId, status: newSupplierId ? "assigned" : "unassigned" } : l))
     );
     try {
-      await api.put(`/logs/${draggableId}/assign`, { supplier_id: newSupplierId });
+      const { data } = await api.put(`/logs/${draggableId}/assign`, { supplier_id: newSupplierId });
+      setLogs((prev) => prev.map((l) => (l.id === data.id ? data : l)));
       if (source.droppableId === UNASSIGNED && newSupplierId) {
         const sup = suppliers.find((s) => s.id === newSupplierId);
         toast.success(`Moved to ${sup?.name || "supplier"} for today`, {
@@ -124,6 +125,27 @@ export default function AdminHome() {
   const removeLog = async (id) => {
     try { await api.delete(`/logs/${id}`); setLogs((p) => p.filter((l) => l.id !== id)); }
     catch { toast.error("Failed"); }
+  };
+
+  // Duplicate a card: same column (then drag it anywhere), or straight into another supplier
+  const copyLog = async (item, supplierId) => {
+    try {
+      const body = supplierId === undefined ? {} : { supplier_id: supplierId };
+      const { data } = await api.post(`/logs/${item.id}/copy`, body);
+      setLogs((prev) => {
+        const i = prev.findIndex((l) => l.id === item.id);
+        const next = [...prev];
+        next.splice(i + 1, 0, data);
+        return next;
+      });
+      toast.success(
+        supplierId === undefined
+          ? "Copied — drag the copy to any supplier"
+          : `Copied to ${supplierName(supplierId)}`
+      );
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail));
+    }
   };
 
   const downloadPDF = async () => {
@@ -402,8 +424,34 @@ export default function AdminHome() {
                                       <span className="text-sm text-[#2C312E]">{item.quantity || "—"}</span>
                                     </div>
                                     <div className="text-[11px] text-[#6B726C] mt-2">by {item.added_by_name}</div>
+                                    {item.alt_suppliers?.length > 0 && (
+                                      <div className="mt-2 pt-2 border-t border-[#E5E1DB]/70" data-testid={`alt-suppliers-${item.id}`}>
+                                        <div className="text-[10px] uppercase tracking-wider text-[#6B726C] mb-1">Also from</div>
+                                        <div className="flex flex-wrap gap-1">
+                                          {item.alt_suppliers.map((s) => (
+                                            <button
+                                              key={s.id}
+                                              data-testid={`copy-to-${item.id}-${s.id}`}
+                                              onClick={() => copyLog(item, s.id)}
+                                              title={`Add a copy under ${s.name}`}
+                                              className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full border border-[#E5E1DB] bg-[#F9F8F6] text-[11px] text-[#4A5D4E] hover:bg-[#4A5D4E] hover:text-white"
+                                            >
+                                              <Plus size={10} /> {s.name}
+                                            </button>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
                                   </div>
                                   <div className="flex flex-col">
+                                  <button
+                                    data-testid={`copy-log-${item.id}`}
+                                    onClick={() => copyLog(item)}
+                                    className="p-1.5 rounded-full text-[#6B726C] hover:text-[#2C312E] hover:bg-[#F2EFEB]"
+                                    title="Copy — then drag the copy to another supplier"
+                                  >
+                                    <CopyPlus size={14} />
+                                  </button>
                                   <button
                                     data-testid={`edit-log-${item.id}`}
                                     onClick={() => setEditing({ id: item.id, medicine_name: item.medicine_name, quantity: item.quantity || "" })}
