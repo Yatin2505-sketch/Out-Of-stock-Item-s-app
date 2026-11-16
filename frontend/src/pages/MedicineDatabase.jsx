@@ -208,15 +208,15 @@ export default function MedicineDatabase() {
                   An item bought from several parties is linked to all of them.
                 </p>
                 <div className="mt-4 rounded-2xl bg-[#F9F8F6] border border-[#E5E1DB] p-4 text-sm text-[#2C312E]">
-                  <div className="font-medium mb-2">Tally Prime se file kaise nikalein / How to export:</div>
+                  <div className="font-medium mb-2">Tally Prime से file कैसे निकालें / How to export:</div>
                   <ol className="list-decimal pl-5 space-y-1 text-[#4A4F4B]">
-                    <li><b>Gateway of Tally</b> par <b>Alt+E</b> (Export) dabayein → <b>Transactions</b></li>
-                    <li>Voucher type: <b>Purchase</b> (ya All Vouchers) / pick Purchase</li>
-                    <li>Period: From – To chunein (jaise poora saal) / choose the dates</li>
-                    <li><b>File Format</b>: <b>XML (Data Interchange)</b>, folder note kar lein</li>
-                    <li><b>Send</b> dabayein, phir wo <b>.xml</b> file neeche chunein / pick that file below</li>
+                    <li><b>Gateway of Tally</b> पर <b>Alt+E</b> (Export) दबाएँ → <b>Transactions</b></li>
+                    <li>Voucher type: <b>Purchase</b> (या All Vouchers) / pick Purchase</li>
+                    <li>Period: From – To चुनें (जैसे पूरा साल) / choose the dates</li>
+                    <li><b>File Format</b>: <b>XML (Data Interchange)</b>, folder note कर लें</li>
+                    <li><b>Send</b> दबाएँ, फिर वो <b>.xml</b> file नीचे चुनें / pick that file below</li>
                   </ol>
-                  <div className="text-xs text-[#6B726C] mt-2">Day Book ka XML export bhi chalega: sirf purchase bills padhe jaate hain, sales waghera chhod diye jaate hain.</div>
+                  <div className="text-xs text-[#6B726C] mt-2">Day Book का XML export भी चलेगा: सिर्फ़ purchase bills पढ़े जाते हैं, sales वग़ैरह छोड़ दिए जाते हैं।</div>
                 </div>
 
                 <label className="mt-5 block">
